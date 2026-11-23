@@ -35,6 +35,7 @@ type
     LabelParameters: TLabel;
     EditParameters: TEdit;
     CheckBoxElevated: TCheckBox;
+    CheckBoxBroker: TCheckBox;
     ButtonStart: TButton;
     ButtonRunAsWindow: TButton;
     ButtonRelaunchAsAdmin: TButton;
@@ -298,6 +299,10 @@ begin
   LDocker.FileName := EditFileName.Text;
   LDocker.Parameters := EditParameters.Text;
   LDocker.RunElevated := CheckBoxElevated.Checked;
+  // An elevated app can not be docked into this non elevated demo directly (UIPI):
+  // an elevated broker (this exe, see the .dpr) docks it for us
+  if CheckBoxBroker.Checked then
+    LDocker.BrokerMode := dbmWhenElevationNeeded;
   if LEntry.DarkBackground then
     LDocker.Color := RGB(12, 12, 12);
 
@@ -351,6 +356,8 @@ begin
         AForm.Docker.Parameters := EditParameters.Text;
       end;
       AForm.Docker.RunElevated := CheckBoxElevated.Checked;
+      if CheckBoxBroker.Checked then
+        AForm.Docker.BrokerMode := dbmWhenElevationNeeded;
       if CheckBoxEmergencyKill.Checked then
         AForm.Docker.EmergencyKillTimeoutMs := EMERGENCY_KILL_MS;
       AForm.Docker.OnLog := AppWindowLog;

@@ -44,6 +44,11 @@ type
     PingTimeoutMs: Cardinal;
     /// <summary>0 = disabled. See TProcessDocker.EmergencyKillTimeoutMs.</summary>
     EmergencyKillTimeoutMs: Cardinal;
+    /// <summary>
+    ///   Optional window of another process whose UI thread is watched too for the
+    ///   emergency kill (the broker watches the host form with it). 0 = none.
+    /// </summary>
+    WatchWindow: HWND;
     /// <summary>Owned by the watchdog (duplicated handles).</summary>
     KillTargets: TKillTargets;
     InitialTitle: string;
@@ -74,6 +79,9 @@ type
   end;
 
 implementation
+
+const
+  WATCH_PING_TIMEOUT_MS = 250;
 
 { TDockWatchdog }
 
@@ -216,8 +224,11 @@ var
   LEmergencyDone: Boolean;
   LUnresponsiveMs: Cardinal;
   LKilled: Boolean;
+  LKillNow: Boolean;
+  LWatchStuckSince: UInt64;
 begin
   NameThreadForDebugging('ProcessDocker.Watchdog');
+  LWatchStuckSince := 0;
 
   LHandles[0] := FStopEvent.Handle;
   LHandleCount := 1;
@@ -310,21 +321,37 @@ begin
         if LHeartbeatPending and (TInterlocked.CompareExchange(FHangAcknowledged, 0, 0) <> 0) then
           LHeartbeatPending := False;
 
+        LKillNow := False;
         if LHeartbeatPending then
-        begin
-          if LNow - LHeartbeatSentAt >= FConfig.EmergencyKillTimeoutMs then
-          begin
-            LEmergencyDone := True;
-            LKilled := KillTargets(FConfig.KillTargets, 1);
-            PostEmergencyKill(LUnresponsiveMs, LKilled);
-          end;
-        end
+          LKillNow := LNow - LHeartbeatSentAt >= FConfig.EmergencyKillTimeoutMs
         else
         begin
           TInterlocked.Exchange(FHangAcknowledged, 0);
           LHeartbeatPending := True;
           LHeartbeatSentAt := LNow;
           PostHeartbeat;
+        end;
+
+        // The window of another process (the host form, when we are the broker) can be
+        // blocked through the shared input queue as well
+        if FConfig.WatchWindow <> 0 then
+        begin
+          if IsWindow(FConfig.WatchWindow) and not PingWindow(FConfig.WatchWindow, WATCH_PING_TIMEOUT_MS) then
+          begin
+            if LWatchStuckSince = 0 then
+              LWatchStuckSince := LNow;
+            if LNow - LWatchStuckSince >= FConfig.EmergencyKillTimeoutMs then
+              LKillNow := True;
+          end
+          else
+            LWatchStuckSince := 0;
+        end;
+
+        if LKillNow then
+        begin
+          LEmergencyDone := True;
+          LKilled := KillTargets(FConfig.KillTargets, 1);
+          PostEmergencyKill(LUnresponsiveMs, LKilled);
         end;
       end;
     end
@@ -337,6 +364,7 @@ begin
       LHangReported := False;
       LHeartbeatPending := False;
       LEmergencyDone := False;
+      LWatchStuckSince := 0;
     end;
   end;
 end;

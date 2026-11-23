@@ -21,6 +21,8 @@ unit ProcessToFormDocker;
       automatic kill / restart on hang, automatic restart on unexpected exit with
       crash loop protection, and an emergency kill when the host UI is blocked.
     - Events with var parameters so the application can veto kills and restarts.
+    - BrokerMode: an ELEVATED application docked into a NON elevated host through an
+      elevated broker process (see ProcessToFormDocker.Broker).
 
   Docking a window of another process is not something Windows officially supports
   for arbitrary applications. It works well for many (classic console, most Win32
@@ -62,6 +64,20 @@ type
   );
 
   TDockPreset = (dpClassicCmd, dpClassicPowerShell, dpPowerShell7, dpWindowsTerminal, dpNotepad);
+
+  /// <summary>
+  ///   Docking an elevated application into a non elevated host through an elevated
+  ///   broker process (see ProcessToFormDocker.Broker). Needs RunProcessDockerBroker in
+  ///   the .dpr.
+  /// </summary>
+  TDockBrokerMode = (
+    dbmOff,                  // Never use a broker
+    dbmWhenElevationNeeded,  // RunElevated, or the exe requires elevation, and the host is not elevated
+    dbmAlways                // Always through a broker (mainly for testing)
+  );
+
+  /// <summary>Custom broker launch (testing, a service...). Returns the broker process handle.</summary>
+  TDockBrokerLaunchHook = reference to function(const AFileName, AParameters: string; AElevated: Boolean): THandle;
 
   TDockPresetInfo = record
     Caption: string;
@@ -168,6 +184,23 @@ type
     FRestartDelayMs: Cardinal;
     FColor: TColor;
     FShowStatusText: Boolean;
+    FBrokerMode: TDockBrokerMode;
+    FBrokerFileName: string;
+    FEmergencyWatchWindow: HWND;
+
+    // Broker (host side)
+    class var FBrokerLaunchHook: TDockBrokerLaunchHook;
+    var
+    FBrokerActive: Boolean;
+    FBrokerProcess: THandle;
+    FBrokerWnd: HWND;
+    FBrokerLinkWnd: HWND;
+    FBrokerSession: Integer;
+    FBrokerCookie: Word;
+    FBrokerSignature: string;
+    FBrokerSessionAlive: Boolean;
+    FBrokerPending: TList<TPair<Word, LPARAM>>;
+    FBrokerEvents: TList<TPair<Integer, string>>;
 
     // Runtime
     FContainer: TProcessDockContainer;
@@ -243,6 +276,7 @@ type
     procedure SetHangTimeoutMs(const AValue: Cardinal);
     procedure SetPollIntervalMs(const AValue: Cardinal);
     procedure SetEmergencyKillTimeoutMs(const AValue: Cardinal);
+    procedure SetEmergencyWatchWindow(const AValue: HWND);
     procedure WatchdogSettingsChanged;
     function GetIsRunning: Boolean;
     function GetEffectiveHangTimeoutMs: Cardinal;
@@ -298,6 +332,25 @@ type
     procedure HandleWatchdogResponding(AId: Integer; AUnresponsiveMs: Cardinal);
     procedure HandleWatchdogTitle(AId: Integer; const ATitle: string);
     procedure HandleWatchdogEmergencyKill(AId: Integer; AUnresponsiveMs: Cardinal; AKilled: Boolean);
+    procedure ProcessHang(AUnresponsiveMs: Cardinal);
+    procedure ProcessResponding(AUnresponsiveMs: Cardinal);
+    procedure ProcessTitle(const ATitle: string);
+    procedure ProcessEmergencyKill(AUnresponsiveMs: Cardinal; AKilled: Boolean);
+
+    // Broker (host side)
+    function NeedsBrokerFor(AElevate: Boolean): Boolean;
+    function BrokerSignature(AElevated: Boolean): string;
+    function BuildBrokerSettings(AElevated: Boolean): string;
+    procedure EnsureBrokerLink;
+    procedure StartViaBroker(AElevated: Boolean);
+    procedure LaunchBroker(AElevated: Boolean; const ASettings: string);
+    procedure ReleaseBroker;
+    function IsBrokerAlive: Boolean;
+    procedure BrokerCommand(ACommand: Word; AArgument: LPARAM = 0);
+    procedure BrokerLinkWndProc(var AMessage: TMessage);
+    function HandleBrokerData(ASender: HWND; const AData: TCopyDataStruct): LRESULT;
+    procedure ProcessBrokerEvents;
+    procedure ProcessBrokerEvent(AEvent: Integer; AFields: TStrings);
 
     // Timer
     procedure TimerTick(Sender: TObject);
@@ -385,6 +438,15 @@ type
     property OriginalWindowRect: TRect read FOriginalRect;
     property OriginalClientRect: TRect read FOriginalClientRect;
     property OriginalWindowStyle: NativeInt read FOriginalStyle;
+    /// <summary>True when the current / last process runs through the elevated broker.</summary>
+    property IsBrokered: Boolean read FBrokerActive;
+    /// <summary>
+    ///   Advanced: a window of another process whose UI is watched for the emergency kill
+    ///   as well (the broker sets the host form here). 0 = none.
+    /// </summary>
+    property EmergencyWatchWindow: HWND read FEmergencyWatchWindow write SetEmergencyWatchWindow;
+    /// <summary>Advanced: replaces the broker launch (ShellExecuteEx "runas" / CreateProcess).</summary>
+    class property BrokerLaunchHook: TDockBrokerLaunchHook read FBrokerLaunchHook write FBrokerLaunchHook;
   published
     /// <summary>Form, panel, tab sheet... the docked window fills it. Defaults to Owner when it is a TWinControl.</summary>
     property HostControl: TWinControl read FHostControl write SetHostControl;
@@ -443,6 +505,15 @@ type
     property RestartWindowMs: Cardinal read FRestartWindowMs write FRestartWindowMs default 60000;
     property RestartDelayMs: Cardinal read FRestartDelayMs write FRestartDelayMs default 1000;
 
+    /// <summary>
+    ///   Show an ELEVATED application in this (non elevated) host through an elevated
+    ///   broker process. Requires RunProcessDockerBroker (ProcessToFormDocker.Broker) at
+    ///   the start of the .dpr, or BrokerFileName.
+    /// </summary>
+    property BrokerMode: TDockBrokerMode read FBrokerMode write FBrokerMode default dbmOff;
+    /// <summary>Broker executable. Empty = this application itself (ParamStr(0)).</summary>
+    property BrokerFileName: string read FBrokerFileName write FBrokerFileName;
+
     property Color: TColor read FColor write SetColor default clBtnFace;
     property ShowStatusText: Boolean read FShowStatusText write SetShowStatusText default True;
 
@@ -471,7 +542,7 @@ const
 implementation
 
 uses
-  Winapi.ShellAPI, System.Math, System.StrUtils;
+  Winapi.ShellAPI, System.Math, System.StrUtils, ProcessToFormDocker.Broker;
 
 type
   TProcessDockerLink = class(TInterfacedObject, IProcessDockerLink)
@@ -494,6 +565,7 @@ const
   ERROR_ELEVATION_REQUIRED_ = 740;
   KILL_WAIT_MS = 3000;
   DOCK_SETTLE_MS = 3000;
+  WM_BROKER_EVENTS = WM_APP + $3B0;
 
   IGNORED_WINDOW_CLASSES: array[0..9] of string = (
     'IME', 'MSCTFIME UI', 'GDI+ Hook Window Class', 'OleMainThreadWndClass', 'tooltips_class32',
@@ -708,6 +780,8 @@ begin
   FResponding := True;
   FRestartHistory := TList<UInt64>.Create;
   FPreLaunchWindows := TDictionary<HWND, Boolean>.Create;
+  FBrokerPending := TList<TPair<Word, LPARAM>>.Create;
+  FBrokerEvents := TList<TPair<Integer, string>>.Create;
 
   LLink := TProcessDockerLink.Create(Self);
   FLinkObject := LLink;
@@ -726,7 +800,15 @@ begin
 
   if not (csDesigning in ComponentState) then
   try
-    if FState in [pdsStarting, pdsRunning, pdsClosing] then
+    if IsBrokerAlive then
+    begin
+      // We may not touch the elevated process: the broker applies the shutdown action
+      if FState in [pdsStarting, pdsRunning, pdsClosing] then
+        BrokerCommand(BROKER_CMD_SHUTDOWN, Ord(FShutdownAction))
+      else
+        BrokerCommand(BROKER_CMD_SHUTDOWN, Ord(dsaKill));
+    end
+    else if FState in [pdsStarting, pdsRunning, pdsClosing] then
       case FShutdownAction of
         dsaCloseThenKill:
           if not CloseGracefullyInternal(FCloseTimeoutMs) then
@@ -767,9 +849,23 @@ begin
     FParkingWnd := 0;
   end;
 
+  if FBrokerProcess <> 0 then
+  begin
+    CloseHandle(FBrokerProcess);
+    FBrokerProcess := 0;
+  end;
+  // A broker that never got our shutdown command quits (and kills) when this window is gone
+  if FBrokerLinkWnd <> 0 then
+  begin
+    DeallocateHWnd(FBrokerLinkWnd);
+    FBrokerLinkWnd := 0;
+  end;
+
   FLink := nil;
   FRestartHistory.Free;
   FPreLaunchWindows.Free;
+  FBrokerPending.Free;
+  FBrokerEvents.Free;
 
   inherited Destroy;
 end;
@@ -904,6 +1000,15 @@ begin
     FContainer.Invalidate;
 end;
 
+procedure TProcessDocker.SetEmergencyWatchWindow(const AValue: HWND);
+begin
+  if FEmergencyWatchWindow <> AValue then
+  begin
+    FEmergencyWatchWindow := AValue;
+    WatchdogSettingsChanged;
+  end;
+end;
+
 procedure TProcessDocker.WatchdogSettingsChanged;
 begin
   // Settings are copied to the watchdog thread when it starts, so start a new one
@@ -994,12 +1099,21 @@ end;
 
 procedure TProcessDocker.ContainerHandleDestroying;
 begin
-  if FIsDocked then
+  // Through a broker the window is the broker's: it parks it itself
+  if FIsDocked and not FBrokerActive then
     ParkWindow;
 end;
 
 procedure TProcessDocker.ContainerHandleCreated;
 begin
+  if FBrokerActive then
+  begin
+    // The broker's panel died with our old container window: tell it the new one
+    if IsRunning and Assigned(FContainer) then
+      BrokerCommand(BROKER_CMD_CONTAINER, LPARAM(FContainer.Handle));
+    Exit;
+  end;
+
   if not FIsParked then
     Exit;
 
@@ -1027,7 +1141,10 @@ begin
     pdsIdle:
       Result := 'Not started';
     pdsStarting:
-      Result := Format('Starting %s %s ...', [ExtractFileName(FFileName), FParameters]);
+      if FBrokerActive and (FBrokerWnd = 0) then
+        Result := Format('Starting %s %s through the elevated broker ...', [ExtractFileName(FFileName), FParameters])
+      else
+        Result := Format('Starting %s %s ...', [ExtractFileName(FFileName), FParameters]);
     pdsRunning:
       if FIsDocked then
         Result := ''
@@ -1177,6 +1294,7 @@ end;
 procedure TProcessDocker.Start;
 var
   LElevationRequired: Boolean;
+  LElevate: Boolean;
 begin
   if IsRunning then
     raise EProcessDocker.Create('TProcessDocker: a process is already running');
@@ -1192,27 +1310,45 @@ begin
   Log('Starting: %s', [BuildCommandLine]);
   SetState(pdsStarting);
   try
-    if FRunElevated and not IsCurrentProcessElevated then
+    LElevate := FRunElevated and not IsCurrentProcessElevated;
+    if NeedsBrokerFor(LElevate) then
+      StartViaBroker(LElevate)
+    else if LElevate then
       LaunchWithShellExecute(True)
     else
     begin
       LaunchWithCreateProcess(LElevationRequired);
       if LElevationRequired then
       begin
-        Log('The executable requires elevation, starting it with "runas"');
-        LaunchWithShellExecute(True);
+        if NeedsBrokerFor(True) then
+        begin
+          Log('The executable requires elevation, starting it through an elevated broker');
+          StartViaBroker(True);
+        end
+        else
+        begin
+          Log('The executable requires elevation, starting it with "runas"');
+          LaunchWithShellExecute(True);
+        end;
       end;
     end;
   except
     on E: Exception do
     begin
       FLastError := E.Message;
+      FBrokerSessionAlive := False;
       SetState(pdsFailed);
       raise;
     end;
   end;
 
   FStartTime := Now;
+  if FBrokerActive then
+  begin
+    // The broker starts and docks it, and reports back
+    UpdateTimer;
+    Exit;
+  end;
   FTreePids := [FLaunchedPid];
   Log('Process started, pid %d', [FLaunchedPid]);
 
@@ -1449,6 +1585,11 @@ begin
   Result := False;
   if FIsDocked then
     Exit(True);
+  if FBrokerActive then
+  begin
+    Log('Dock / Undock is not available for an application shown through the broker');
+    Exit;
+  end;
   if (FDockedWnd = 0) or not IsWindow(FDockedWnd) then
     Exit;
 
@@ -1565,6 +1706,11 @@ end;
 
 procedure TProcessDocker.Undock;
 begin
+  if FBrokerActive then
+  begin
+    Log('Dock / Undock is not available for an application shown through the broker');
+    Exit;
+  end;
   if not (FIsDocked or FIsParked) then
     Exit;
 
@@ -1582,6 +1728,13 @@ procedure TProcessDocker.UpdateLayout(AForce: Boolean);
 var
   LFlags: UINT;
 begin
+  if FBrokerActive then
+  begin
+    // The broker follows our container size; this just makes it react at once
+    if FIsDocked and IsRunning then
+      BrokerCommand(BROKER_CMD_LAYOUT);
+    Exit;
+  end;
   if not FIsDocked or not Assigned(FContainer) or not FContainer.HandleAllocated then
     Exit;
   if (FDockedWnd = 0) or not IsWindow(FDockedWnd) then
@@ -1626,6 +1779,12 @@ end;
 
 procedure TProcessDocker.FocusDockedWindow;
 begin
+  if FBrokerActive then
+  begin
+    if FIsDocked and IsRunning then
+      BrokerCommand(BROKER_CMD_FOCUS);
+    Exit;
+  end;
   if FIsDocked and FResponding and not FSuspended and (FDockedWnd <> 0) and IsWindow(FDockedWnd) then
     Winapi.Windows.SetFocus(FDockedWnd);
 end;
@@ -1635,6 +1794,12 @@ var
   LText: string;
   LChar: Char;
 begin
+  if FBrokerActive then
+  begin
+    // On purpose: it would let any non elevated program type into an elevated window
+    Log('SendTextInput is not available through the elevated broker');
+    Exit;
+  end;
   if (FDockedWnd = 0) or not IsWindow(FDockedWnd) then
     Exit;
 
@@ -1663,6 +1828,8 @@ end;
 
 function TProcessDocker.OwnProcessesAlive: Boolean;
 begin
+  if FBrokerActive then
+    Exit(FBrokerSessionAlive and IsBrokerAlive);
   Result := IsProcessHandleAlive(FLaunchedProcess)
     or (not FWindowIsForeign and IsProcessHandleAlive(FWindowProcess))
     or ((FLaunchedProcess <> 0) and (Length(GetDescendantProcessIds([FLaunchedPid])) > 0));
@@ -1670,6 +1837,8 @@ end;
 
 function TProcessDocker.IsSessionAlive: Boolean;
 begin
+  if FBrokerActive then
+    Exit(FBrokerSessionAlive and IsBrokerAlive);
   Result := ((FDockedWnd <> 0) and IsWindow(FDockedWnd)) or OwnProcessesAlive;
 end;
 
@@ -1678,6 +1847,9 @@ var
   LCode: DWORD;
 begin
   Result := FExitCode;
+  // Through a broker: reported with the exit event
+  if FBrokerActive then
+    Exit;
   if not FWindowIsForeign and (FWindowProcess <> 0) and GetExitCodeProcess(FWindowProcess, LCode)
     and (LCode <> STILL_ACTIVE) then
     Exit(LCode);
@@ -1698,7 +1870,10 @@ begin
     if TicksNow - LStart >= ATimeoutMs then
       Exit(False);
 
-    if not FWindowIsForeign and IsProcessHandleAlive(FWindowProcess) then
+    // Through a broker the exit arrives as a sent WM_COPYDATA, processed below
+    if FBrokerActive then
+      LHandle := FBrokerProcess
+    else if not FWindowIsForeign and IsProcessHandleAlive(FWindowProcess) then
       LHandle := FWindowProcess
     else if IsProcessHandleAlive(FLaunchedProcess) then
       LHandle := FLaunchedProcess
@@ -1718,7 +1893,9 @@ end;
 
 procedure TProcessDocker.PostCloseMessage;
 begin
-  if (FDockedWnd <> 0) and IsWindow(FDockedWnd) then
+  if FBrokerActive then
+    BrokerCommand(BROKER_CMD_CLOSE)
+  else if (FDockedWnd <> 0) and IsWindow(FDockedWnd) then
     PostMessage(FDockedWnd, WM_CLOSE, 0, 0)
   else
     Log('No window to send WM_CLOSE to');
@@ -1787,7 +1964,10 @@ begin
   FExpectingExit := True;
   FCloseRequested := False;
   Log('Killing process');
-  KillTargets(BuildKillTargets, 1);
+  if FBrokerActive then
+    BrokerCommand(BROKER_CMD_KILL)
+  else
+    KillTargets(BuildKillTargets, 1);
 
   Result := WaitForSessionEnd(KILL_WAIT_MS);
   if Result then
@@ -1922,7 +2102,7 @@ begin
   LExpected := AExpected or FExpectingExit;
 
   // The window is gone but some of our processes may still linger (tray apps, helpers)
-  if OwnProcessesAlive then
+  if not FBrokerActive and OwnProcessesAlive then
   begin
     WaitForSessionEnd(1000);
     if OwnProcessesAlive then
@@ -1961,6 +2141,10 @@ begin
   end
   else if not LExpected and FRestartOnUnexpectedExit then
     ScheduleRestart(drrUnexpectedExit, FRestartDelayMs);
+
+  // Keep the elevated broker only for a restart (no new UAC prompt)
+  if FBrokerActive and not FRestartPending then
+    ReleaseBroker;
 end;
 
 procedure TProcessDocker.CloseSessionHandles;
@@ -2006,6 +2190,8 @@ begin
   FDiscovering := False;
   FCloseRequested := False;
   FRestartAfterExit := False;
+  FBrokerActive := False;
+  FBrokerSessionAlive := False;
 end;
 
 function TProcessDocker.SuspendProcess: Boolean;
@@ -2015,6 +2201,13 @@ begin
   Result := False;
   if not IsRunning or FSuspended then
     Exit;
+
+  if FBrokerActive then
+  begin
+    BrokerCommand(BROKER_CMD_SUSPEND);
+    FSuspended := True;
+    Exit(True);
+  end;
 
   if FLaunchedProcess <> 0 then
     for LPid in GetDescendantProcessIds([FLaunchedPid]) do
@@ -2039,6 +2232,13 @@ begin
   Result := False;
   if not FSuspended then
     Exit;
+
+  if FBrokerActive then
+  begin
+    BrokerCommand(BROKER_CMD_RESUME);
+    FSuspended := False;
+    Exit(True);
+  end;
 
   if FLaunchedProcess <> 0 then
     for LPid in GetDescendantProcessIds([FLaunchedPid]) do
@@ -2129,6 +2329,7 @@ begin
   LConfig.HangTimeoutMs := LHangTimeout;
   LConfig.PingTimeoutMs := Min(Cardinal(1000), Max(Cardinal(100), LHangTimeout div 2));
   LConfig.EmergencyKillTimeoutMs := FEmergencyKillTimeoutMs;
+  LConfig.WatchWindow := FEmergencyWatchWindow;
   LConfig.KillTargets := BuildKillTargets.Duplicate;
   LConfig.InitialTitle := FTitle;
 
@@ -2163,8 +2364,6 @@ begin
 end;
 
 procedure TProcessDocker.HandleWatchdogHung(AId: Integer; AUnresponsiveMs: Cardinal);
-var
-  LAction: TDockHangAction;
 begin
   if not IsCurrentWatchdog(AId) then
     Exit;
@@ -2180,6 +2379,17 @@ begin
   // dialog in OnHung keeps processing the watchdog heartbeats, a blocked one does not.
   if IsCurrentWatchdog(AId) then
     FWatchdog.AcknowledgeHang;
+
+  ProcessHang(AUnresponsiveMs);
+end;
+
+procedure TProcessDocker.ProcessHang(AUnresponsiveMs: Cardinal);
+var
+  LAction: TDockHangAction;
+begin
+  FResponding := False;
+  if FUnresponsiveSince = 0 then
+    FUnresponsiveSince := TicksNow - AUnresponsiveMs;
 
   LAction := FHangAction;
   if Assigned(FOnHung) and CanFireEvents then
@@ -2198,12 +2408,16 @@ end;
 
 procedure TProcessDocker.HandleWatchdogResponding(AId: Integer; AUnresponsiveMs: Cardinal);
 begin
-  if not IsCurrentWatchdog(AId) then
-    Exit;
+  if IsCurrentWatchdog(AId) then
+    ProcessResponding(AUnresponsiveMs);
+end;
 
+procedure TProcessDocker.ProcessResponding(AUnresponsiveMs: Cardinal);
+begin
   FResponding := True;
   FUnresponsiveSince := 0;
-  Log('Window is responding again (was unresponsive %d ms)', [AUnresponsiveMs]);
+  if not FBrokerActive then // the broker logs it itself
+    Log('Window is responding again (was unresponsive %d ms)', [AUnresponsiveMs]);
   if Assigned(FOnResponding) and CanFireEvents then
     FOnResponding(Self, GetInfo, AUnresponsiveMs);
   UpdateLayout(False);
@@ -2211,9 +2425,12 @@ end;
 
 procedure TProcessDocker.HandleWatchdogTitle(AId: Integer; const ATitle: string);
 begin
-  if not IsCurrentWatchdog(AId) then
-    Exit;
+  if IsCurrentWatchdog(AId) then
+    ProcessTitle(ATitle);
+end;
 
+procedure TProcessDocker.ProcessTitle(const ATitle: string);
+begin
   FTitle := ATitle;
   if Assigned(FOnTitleChange) and CanFireEvents then
     FOnTitleChange(Self, ATitle);
@@ -2221,11 +2438,16 @@ end;
 
 procedure TProcessDocker.HandleWatchdogEmergencyKill(AId: Integer; AUnresponsiveMs: Cardinal; AKilled: Boolean);
 begin
-  if not IsCurrentWatchdog(AId) then
-    Exit;
+  if IsCurrentWatchdog(AId) then
+    ProcessEmergencyKill(AUnresponsiveMs, AKilled);
+end;
 
+procedure TProcessDocker.ProcessEmergencyKill(AUnresponsiveMs: Cardinal; AKilled: Boolean);
+begin
   FExpectingExit := True;
-  if AKilled then
+  if FBrokerActive then
+    // The broker logs the details
+  else if AKilled then
     Log('EMERGENCY KILL: the host UI thread was blocked while the docked window was hung, process killed')
   else
     Log('EMERGENCY KILL failed: could not terminate the process');
@@ -2240,21 +2462,409 @@ begin
     FOnEmergencyKill(Self, GetInfo, AUnresponsiveMs);
 end;
 
+{ Broker (host side) }
+
+function BoolText(AValue: Boolean): string;
+begin
+  if AValue then
+    Result := '1'
+  else
+    Result := '0';
+end;
+
+function TProcessDocker.NeedsBrokerFor(AElevate: Boolean): Boolean;
+begin
+  Result := (FBrokerMode = dbmAlways)
+    or ((FBrokerMode = dbmWhenElevationNeeded) and AElevate and not IsCurrentProcessElevated);
+end;
+
+function TProcessDocker.IsBrokerAlive: Boolean;
+begin
+  Result := (FBrokerProcess <> 0) and IsProcessHandleAlive(FBrokerProcess);
+end;
+
+function TProcessDocker.BrokerSignature(AElevated: Boolean): string;
+var
+  LList: TStringList;
+begin
+  // Everything the broker is started with. It never accepts another command line.
+  LList := TStringList.Create;
+  try
+    LList.Add('elevated=' + BoolText(AElevated));
+    LList.Add('file=' + BrokerValue(FFileName));
+    LList.Add('params=' + BrokerValue(FParameters));
+    LList.Add('dir=' + BrokerValue(FWorkingDirectory));
+    LList.Add('starthidden=' + BoolText(FStartHidden));
+    LList.Add('class=' + BrokerValue(FWindowClassName));
+    LList.Add('procname=' + BrokerValue(FWindowProcessName));
+    LList.Add('foreign=' + BoolText(FAcceptForeignWindows));
+    LList.Add('findtimeout=' + IntToStr(FFindWindowTimeoutMs));
+    LList.Add('childstyle=' + BoolText(FUseChildStyle));
+    LList.Add('removeframe=' + BoolText(FRemoveWindowFrame));
+    LList.Add('focusondock=' + BoolText(FFocusOnDock));
+    LList.Add('allowkillforeign=' + BoolText(FAllowKillForeignProcess));
+    LList.Add('closetimeout=' + IntToStr(FCloseTimeoutMs));
+    LList.Add('hangdetection=' + BoolText(FHangDetection));
+    LList.Add('hangtimeout=' + IntToStr(FHangTimeoutMs));
+    LList.Add('poll=' + IntToStr(FPollIntervalMs));
+    LList.Add('emergency=' + IntToStr(FEmergencyKillTimeoutMs));
+    LList.Add('color=' + IntToStr(ColorToRGB(FColor)));
+    Result := LList.Text;
+  finally
+    LList.Free;
+  end;
+end;
+
+function TProcessDocker.BuildBrokerSettings(AElevated: Boolean): string;
+begin
+  Result := BrokerSignature(AElevated)
+    + 'container=' + IntToStr(NativeUInt(FContainer.Handle)) + sLineBreak
+    + 'link=' + IntToStr(NativeUInt(FBrokerLinkWnd)) + sLineBreak
+    + 'hostpid=' + IntToStr(GetCurrentProcessId) + sLineBreak
+    + 'cookie=' + IntToStr(FBrokerCookie) + sLineBreak
+    + 'session=' + IntToStr(FBrokerSession) + sLineBreak;
+end;
+
+procedure TProcessDocker.EnsureBrokerLink;
+begin
+  if FBrokerLinkWnd = 0 then
+    FBrokerLinkWnd := AllocateHWnd(BrokerLinkWndProc);
+end;
+
+procedure TProcessDocker.StartViaBroker(AElevated: Boolean);
+var
+  LSignature: string;
+begin
+  EnsureBrokerLink;
+  FBrokerActive := True;
+  FBrokerSessionAlive := True;
+  Inc(FBrokerSession);
+  FLaunchedElevated := AElevated or IsCurrentProcessElevated;
+
+  LSignature := BrokerSignature(AElevated);
+  if IsBrokerAlive and (LSignature = FBrokerSignature) then
+  begin
+    Log('Starting again through the running broker');
+    BrokerCommand(BROKER_CMD_START, FBrokerSession);
+    Exit;
+  end;
+
+  ReleaseBroker;
+  // Identifies our broker; also guards against commands to / events from strangers
+  FBrokerCookie := Word(1 + (GetTickCount64 * 2654435761 + NativeUInt(Self) + GetCurrentProcessId) mod 65534);
+  LaunchBroker(AElevated, BuildBrokerSettings(AElevated));
+  FBrokerSignature := LSignature;
+end;
+
+procedure TProcessDocker.LaunchBroker(AElevated: Boolean; const ASettings: string);
+var
+  LFileName: string;
+  LParameters: string;
+  LProcess: THandle;
+  LInfo: TShellExecuteInfo;
+  LStartupInfo: TStartupInfo;
+  LProcessInfo: TProcessInformation;
+  LCommandLine: string;
+  LForm: TCustomForm;
+  LError: DWORD;
+begin
+  LFileName := FBrokerFileName;
+  if LFileName = '' then
+  begin
+    LFileName := ParamStr(0);
+    if not IsBrokerEntryPointReady and not Assigned(FBrokerLaunchHook) then
+      raise EProcessDocker.Create('BrokerMode: call RunProcessDockerBroker (unit ProcessToFormDocker.Broker) ' +
+        'first in the .dpr, or set BrokerFileName');
+  end;
+  LParameters := Format('/%s %s', [BROKER_SWITCH, EncodeBrokerData(ASettings)]);
+
+  if Assigned(FBrokerLaunchHook) then
+    LProcess := FBrokerLaunchHook(LFileName, LParameters, AElevated)
+  else if AElevated then
+  begin
+    LInfo := Default(TShellExecuteInfo);
+    LInfo.cbSize := SizeOf(LInfo);
+    LInfo.fMask := SEE_MASK_NOCLOSEPROCESS or SEE_MASK_NOASYNC;
+    LInfo.lpVerb := 'runas';
+    LInfo.lpFile := PChar(LFileName);
+    LInfo.lpParameters := PChar(LParameters);
+    LInfo.nShow := SW_HIDE;
+    LForm := GetParentForm(FContainer);
+    if Assigned(LForm) and LForm.HandleAllocated then
+      LInfo.Wnd := LForm.Handle;
+    if not ShellExecuteEx(@LInfo) then
+    begin
+      LError := GetLastError;
+      if LError = ERROR_CANCELLED then
+        raise EProcessDocker.CreateFmt('Starting "%s" elevated was cancelled by the user', [FFileName]);
+      raise EProcessDocker.CreateFmt('Could not start the elevated broker: %s', [SysErrorMessage(LError)]);
+    end;
+    LProcess := LInfo.hProcess;
+  end
+  else
+  begin
+    LCommandLine := Format('"%s" %s', [LFileName, LParameters]);
+    UniqueString(LCommandLine);
+    LStartupInfo := Default(TStartupInfo);
+    LStartupInfo.cb := SizeOf(LStartupInfo);
+    LStartupInfo.dwFlags := STARTF_USESHOWWINDOW;
+    LStartupInfo.wShowWindow := SW_HIDE;
+    LProcessInfo := Default(TProcessInformation);
+    if not CreateProcess(nil, PChar(LCommandLine), nil, nil, False, CREATE_DEFAULT_ERROR_MODE, nil, nil,
+      LStartupInfo, LProcessInfo) then
+      raise EProcessDocker.CreateFmt('Could not start the broker: %s', [SysErrorMessage(GetLastError)]);
+    CloseHandle(LProcessInfo.hThread);
+    LProcess := LProcessInfo.hProcess;
+  end;
+
+  if LProcess = 0 then
+    raise EProcessDocker.Create('Could not start the broker');
+
+  FBrokerProcess := LProcess;
+  FBrokerWnd := 0;
+  FBrokerPending.Clear;
+  Log('Broker started (pid %d%s)', [GetProcessIdOfHandle(LProcess), IfThen(AElevated, ', elevated', '')]);
+end;
+
+procedure TProcessDocker.ReleaseBroker;
+begin
+  if FBrokerProcess <> 0 then
+  begin
+    if IsProcessHandleAlive(FBrokerProcess) then
+      BrokerCommand(BROKER_CMD_SHUTDOWN, Ord(dsaKill));
+    CloseHandle(FBrokerProcess);
+    FBrokerProcess := 0;
+  end;
+  FBrokerWnd := 0;
+  FBrokerPending.Clear;
+  FBrokerSignature := '';
+  // A broker that says hello after this is told to quit
+  FBrokerCookie := 0;
+end;
+
+procedure TProcessDocker.BrokerCommand(ACommand: Word; AArgument: LPARAM);
+begin
+  if FBrokerWnd <> 0 then
+    PostMessage(FBrokerWnd, BrokerCommandMessage, MakeWParam(ACommand, FBrokerCookie), AArgument)
+  else if (ACommand <> BROKER_CMD_LAYOUT) and (ACommand <> BROKER_CMD_FOCUS) then
+    // Not connected yet (UAC prompt open...): sent on hello
+    FBrokerPending.Add(TPair<Word, LPARAM>.Create(ACommand, AArgument));
+end;
+
+procedure TProcessDocker.BrokerLinkWndProc(var AMessage: TMessage);
+begin
+  case AMessage.Msg of
+    WM_COPYDATA:
+      AMessage.Result := HandleBrokerData(HWND(AMessage.WParam), PCopyDataStruct(AMessage.LParam)^);
+    WM_BROKER_EVENTS:
+      ProcessBrokerEvents;
+  else
+    AMessage.Result := DefWindowProc(FBrokerLinkWnd, AMessage.Msg, AMessage.WParam, AMessage.LParam);
+  end;
+end;
+
+function TProcessDocker.HandleBrokerData(ASender: HWND; const AData: TCopyDataStruct): LRESULT;
+var
+  LText: string;
+  LEvent: Integer;
+  LFields: TStringList;
+  LCookie: Integer;
+  LSession: Integer;
+  LWnd: HWND;
+  LPending: TPair<Word, LPARAM>;
+begin
+  // Sent message: may arrive while we wait in CloseGracefully / Kill. Only update the
+  // session state here, the events are fired later from the posted WM_BROKER_EVENTS.
+  Result := 1;
+  LText := ReadBrokerData(AData);
+  LEvent := Integer(AData.dwData);
+  LFields := TStringList.Create;
+  try
+    LFields.Text := LText;
+    LCookie := StrToIntDef(LFields.Values['cookie'], -1);
+    if (FBrokerCookie = 0) or (LCookie <> FBrokerCookie) then
+    begin
+      // A broker we gave up on (UAC prompt answered after a Stop...): tell it to quit
+      if (LEvent = BROKER_EVT_HELLO) and (LCookie > 0) then
+      begin
+        LWnd := HWND(StrToInt64Def(LFields.Values['wnd'], 0));
+        if LWnd <> 0 then
+          PostMessage(LWnd, BrokerCommandMessage, MakeWParam(BROKER_CMD_SHUTDOWN, Word(LCookie)), Ord(dsaKill));
+      end;
+      Exit;
+    end;
+
+    LSession := StrToIntDef(LFields.Values['session'], -1);
+    case LEvent of
+      BROKER_EVT_HELLO:
+        begin
+          FBrokerWnd := HWND(StrToInt64Def(LFields.Values['wnd'], 0));
+          for LPending in FBrokerPending do
+            PostMessage(FBrokerWnd, BrokerCommandMessage, MakeWParam(LPending.Key, FBrokerCookie), LPending.Value);
+          FBrokerPending.Clear;
+        end;
+      BROKER_EVT_EXITED:
+        if LSession = FBrokerSession then
+        begin
+          FExitCode := DWORD(StrToInt64Def(LFields.Values['code'], 0));
+          if LFields.Values['expected'] = '1' then
+            FExpectingExit := True;
+          FBrokerSessionAlive := False;
+        end;
+      BROKER_EVT_STARTFAILED:
+        if LSession = FBrokerSession then
+          FBrokerSessionAlive := False;
+      BROKER_EVT_DOCKFAILED:
+        if (LSession = FBrokerSession) and (LFields.Values['running'] <> '1') then
+          FBrokerSessionAlive := False;
+    end;
+  finally
+    LFields.Free;
+  end;
+
+  FBrokerEvents.Add(TPair<Integer, string>.Create(LEvent, LText));
+  PostMessage(FBrokerLinkWnd, WM_BROKER_EVENTS, 0, 0);
+end;
+
+procedure TProcessDocker.ProcessBrokerEvents;
+var
+  LItem: TPair<Integer, string>;
+  LFields: TStringList;
+begin
+  while (FBrokerEvents.Count > 0) and not FShuttingDown do
+  begin
+    // Taken out first: an event handler may run a message loop and get here again
+    LItem := FBrokerEvents[0];
+    FBrokerEvents.Delete(0);
+    LFields := TStringList.Create;
+    try
+      LFields.Text := LItem.Value;
+      if (LItem.Key in [BROKER_EVT_HELLO, BROKER_EVT_LOG])
+        or (StrToIntDef(LFields.Values['session'], -1) = FBrokerSession) then
+        ProcessBrokerEvent(LItem.Key, LFields);
+    finally
+      LFields.Free;
+    end;
+  end;
+end;
+
+procedure TProcessDocker.ProcessBrokerEvent(AEvent: Integer; AFields: TStrings);
+
+  function Num(const AName: string): Int64;
+  begin
+    Result := StrToInt64Def(AFields.Values[AName], 0);
+  end;
+
+var
+  LReason: string;
+begin
+  case AEvent of
+    BROKER_EVT_HELLO:
+      Log('Broker connected (pid %d%s)', [Num('pid'), IfThen(AFields.Values['elevated'] = '1', ', elevated', '')]);
+
+    BROKER_EVT_LOG:
+      Log('Broker: ' + AFields.Values['text']);
+
+    BROKER_EVT_STARTED:
+      FLaunchedPid := DWORD(Num('pid'));
+
+    BROKER_EVT_STARTFAILED:
+      if IsRunning then
+      begin
+        FLastError := AFields.Values['reason'];
+        Log(FLastError);
+        SetState(pdsFailed);
+        DoDockFailed(FLastError);
+        if not FRestartPending then
+          ReleaseBroker;
+      end;
+
+    BROKER_EVT_DOCKED:
+      if IsRunning then
+      begin
+        FDockedWnd := HWND(Num('wnd'));
+        FWindowPid := DWORD(Num('pid'));
+        FLaunchedPid := DWORD(Num('launchedpid'));
+        FWindowClassFound := AFields.Values['class'];
+        FWindowProcessNameFound := AFields.Values['procname'];
+        FTitle := AFields.Values['title'];
+        FWindowIsForeign := AFields.Values['foreign'] = '1';
+        FLaunchedElevated := AFields.Values['elevated'] = '1';
+        FOriginalStyle := NativeInt(Num('style'));
+        FOriginalClientRect := Rect(Integer(Num('clientleft')), Integer(Num('clienttop')),
+          Integer(Num('clientright')), Integer(Num('clientbottom')));
+        FOriginalRect := FOriginalClientRect;
+        FIsDocked := True;
+        FResponding := True;
+        FLastError := '';
+        SetState(pdsRunning);
+        DoDocked;
+      end;
+
+    BROKER_EVT_DOCKFAILED:
+      if IsRunning then
+      begin
+        LReason := AFields.Values['reason'];
+        FLastError := LReason;
+        FIsDocked := False;
+        if AFields.Values['running'] = '1' then
+          SetState(pdsRunning) // in its own window
+        else
+        begin
+          SetState(pdsFailed);
+          if not FRestartPending then
+            ReleaseBroker;
+        end;
+        DoDockFailed(LReason);
+      end;
+
+    BROKER_EVT_HUNG:
+      if IsRunning then
+        ProcessHang(Cardinal(Num('ms')));
+
+    BROKER_EVT_RESPONDING:
+      if IsRunning then
+        ProcessResponding(Cardinal(Num('ms')));
+
+    BROKER_EVT_TITLE:
+      ProcessTitle(AFields.Values['title']);
+
+    BROKER_EVT_EMERGENCY:
+      if IsRunning then
+        ProcessEmergencyKill(Cardinal(Num('ms')), True);
+
+    BROKER_EVT_EXITED:
+      if IsRunning then
+        HandleSessionEnded(AFields.Values['expected'] = '1');
+  end;
+end;
+
 { Timer }
 
 procedure TProcessDocker.UpdateTimer;
 begin
   if Assigned(FTimer) then
-    FTimer.Enabled := (FDiscovering or FCloseRequested or FRestartPending or (FIsDocked and (TicksNow < FSettleUntil)))
-      and not FShuttingDown;
+    FTimer.Enabled := (FDiscovering or FCloseRequested or FRestartPending or (FIsDocked and (TicksNow < FSettleUntil))
+      or (FBrokerActive and IsRunning)) and not FShuttingDown;
 end;
 
 procedure TProcessDocker.TimerTick(Sender: TObject);
 var
   LReason: TDockRestartReason;
+  LCode: DWORD;
 begin
   FTimer.Enabled := False;
   try
+    // The broker process itself ended (crash, killed): the session is over
+    if FBrokerActive and IsRunning and (FBrokerProcess <> 0) and not IsProcessHandleAlive(FBrokerProcess) then
+    begin
+      Log('The broker process has ended');
+      if FBrokerSessionAlive and GetExitCodeProcess(FBrokerProcess, LCode) then
+        FExitCode := LCode;
+      FBrokerSessionAlive := False;
+      HandleSessionEnded(False);
+    end;
+
     if FDiscovering then
       DiscoverStep;
 
@@ -2293,6 +2903,9 @@ begin
           DoDockFailed(E.Message);
         end;
       end;
+      // Restart not allowed / failed: the broker kept for it is not needed any more
+      if FBrokerActive and not IsRunning and not FRestartPending then
+        ReleaseBroker;
     end;
   finally
     UpdateTimer;

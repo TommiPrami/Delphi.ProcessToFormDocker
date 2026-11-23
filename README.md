@@ -25,6 +25,7 @@ Add the `Source` folder to your search path. Units:
 |---|---|
 | `ProcessToFormDocker.pas` | `TProcessDocker` component and its container control |
 | `ProcessToFormDocker.Form.pas` | `TProcessDockForm`: run an app in a modal form that looks like the app's own window, get its exit code |
+| `ProcessToFormDocker.Broker.pas` | Elevated broker: dock an elevated app into a non elevated host (`RunProcessDockerBroker`) |
 | `ProcessToFormDocker.Watchdog.pas` | Background thread: exit, title, hang detection, emergency kill |
 | `ProcessToFormDocker.WinApi.pas` | Plain Win32 helpers, usable on their own (`KillProcessTree`, `GetSystemHungAppTimeout`, `RelaunchSelfElevated`, job objects...) |
 
@@ -193,11 +194,71 @@ messages to an elevated window**. So:
 | not elevated | not elevated | Works |
 | elevated | elevated (inherits, no UAC prompt) | Works |
 | elevated | not elevated | Works |
-| not elevated | elevated | **Cannot dock**. The process runs in its own window and `OnDockFailed` explains why. |
+| not elevated | elevated | **Works with `BrokerMode`** (below). Without it, the process runs in its own window and `OnDockFailed` explains why. |
 
 `RelaunchSelfElevated` (in `ProcessToFormDocker.WinApi`) restarts your application elevated. The
-demo has a button for it. `KillOnHostExit` is not available for processes started elevated from a
-non-elevated host.
+demo has a button for it. Without a broker, `KillOnHostExit` is not available for processes started
+elevated from a non-elevated host.
+
+### Elevated application in a non-elevated host: the broker
+
+A running process can't be elevated, and running your whole application as administrator just
+to show one elevated tool is not nice. UIPI only blocks *lower → higher*, so the docking is done
+from the elevated side:
+
+```pascal
+// .dpr: first thing, before Application.Initialize, single instance checks etc.
+uses
+  ProcessToFormDocker.Broker;
+begin
+  if RunProcessDockerBroker then
+    Exit;
+  Application.Initialize;
+  ...
+
+// Anywhere
+FDocker.FileName := 'C:\Tools\LicenseTool.exe';   // requireAdministrator in its manifest
+FDocker.BrokerMode := dbmWhenElevationNeeded;
+FDocker.Start;                                     // one UAC prompt
+```
+
+When the application needs elevation (`RunElevated`, or its manifest requires it) and the host is
+not elevated, `TProcessDocker` starts **a copy of your exe elevated** with the
+`/ProcessDockerBroker` switch. The UAC prompt shows your application's name. That broker:
+
+- creates a panel of its own *inside* your container window (allowed, it is the higher side),
+- starts the application and docks it there with a normal `TProcessDocker`,
+- follows your container's size,
+- executes what your host can't do itself: close, kill, suspend, hang detection,
+- reports everything back. **Your events work as usual**: `OnDocked`, `OnHung` (with its
+  `AAction`), `OnBeforeKill`, `OnProcessExit` with the exit code, `RestartOnUnexpectedExit`, and
+  so on. `IsBrokered` tells you it is in use.
+- **dies with your host**: if your application exits or crashes, the broker kills the elevated
+  application and exits.
+
+The elevation lasts exactly as long as the elevated application runs. A restart reuses the broker,
+so there is no second UAC prompt. With `TProcessDockForm`, set `AForm.Docker.BrokerMode` in the
+configure callback.
+
+Security: the command line is fixed when the broker starts, and the broker accepts only a few
+commands from the host (close, kill, suspend, resume, focus, layout). It never forwards keyboard
+input, so `SendTextInput` is refused, and `Undock` / `Dock` are not available either. That way
+other non-elevated programs can't use the broker to type into or run anything as administrator.
+
+Good to know:
+
+- `BrokerFileName` can name a separate broker exe instead (its `.dpr` calls
+  `RunProcessDockerBroker`). The UAC prompt then shows that exe.
+- A hung elevated application can still block your UI through the shared input queue. The
+  broker's emergency kill also watches **your** window: with `EmergencyKillTimeoutMs` set, it
+  kills the hung application when your form stops responding.
+- The watchdog settings are passed to the broker when it starts. Changing them later applies to
+  the next start.
+- `dbmAlways` uses a broker even when no elevation is needed (testing).
+
+`Tests/ElevatedBroker` tests all of this without UAC prompts. Its host runs at *low* integrity,
+and the broker and application at normal integrity, which follows the same UIPI rules.
+`ElevatedBrokerTest.exe real <exe>` runs the real thing with a UAC prompt.
 
 ## Compatibility
 
@@ -225,6 +286,8 @@ If an application behaves badly, try `UseChildStyle := False` (no `WS_CHILD`),
 
 - Each tab docks one process: the terminal presets, Character Map, Notepad (to show a failure),
   Registry Editor (to show elevation), or a custom command.
+- **Dock elevated apps via broker** (on by default): Registry Editor and other elevated apps are
+  docked into the non-elevated demo after one UAC prompt.
 - Buttons for close / kill / restart / undock / simulate hang (suspend) / resume / send text to
   the console.
 - **Run as app window...** runs the selected command with `TProcessDockForm.ExecuteEx` and reacts

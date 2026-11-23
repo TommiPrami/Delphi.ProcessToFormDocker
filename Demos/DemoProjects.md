@@ -19,5 +19,8 @@ Try this:
    **Run as app window...**. A modal form that looks like a plain console window appears. It
    closes by itself after about 2 s, and the demo reports exit code 5. Run it again and close the
    window yourself: you get `$C000013A`, the exit code of a console closed by the user.
-6. Start *Registry Editor*. It requires elevation and can not be docked into a non-elevated host.
-   Use **Restart demo as admin** and try again.
+6. Start *Registry Editor*. It requires elevation. With **Dock elevated apps via broker** ticked
+   (the default) you get one UAC prompt, and it is docked into this non-elevated demo through the
+   elevated broker. Closing the tab closes it; closing the demo ends it too.
+7. Untick the broker option and start *Registry Editor* again. Now Windows (UIPI) blocks the
+   docking and it runs in its own window. **Restart demo as admin** is the other way around it.

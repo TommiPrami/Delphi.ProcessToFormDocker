@@ -92,6 +92,23 @@ object MainForm: TMainForm
       Caption = 'Run elevated'
       TabOrder = 3
     end
+    object CheckBoxBroker: TCheckBox
+      AlignWithMargins = True
+      Left = 965
+      Top = 7
+      Width = 190
+      Height = 19
+      Hint = 
+        'BrokerMode = dbmWhenElevationNeeded: an elevated app is docked through an e' +
+        'levated broker, this demo stays non elevated'
+      Margins.Top = 5
+      Caption = 'Dock elevated apps via broker'
+      Checked = True
+      ParentShowHint = False
+      ShowHint = True
+      State = cbChecked
+      TabOrder = 4
+    end
     object ButtonStart: TButton
       AlignWithMargins = True
       Left = 965
@@ -100,7 +117,7 @@ object MainForm: TMainForm
       Height = 25
       Caption = 'Start in new tab'
       Default = True
-      TabOrder = 4
+      TabOrder = 5
       OnClick = ButtonStartClick
     end
     object ButtonRunAsWindow: TButton
@@ -115,7 +132,7 @@ object MainForm: TMainForm
       Caption = 'Run as app window...'
       ParentShowHint = False
       ShowHint = True
-      TabOrder = 5
+      TabOrder = 6
       OnClick = ButtonRunAsWindowClick
     end
     object ButtonRelaunchAsAdmin: TButton
@@ -128,7 +145,7 @@ object MainForm: TMainForm
       Caption = 'Restart demo as admin'
       ParentShowHint = False
       ShowHint = True
-      TabOrder = 6
+      TabOrder = 7
       OnClick = ButtonRelaunchAsAdminClick
     end
   end
