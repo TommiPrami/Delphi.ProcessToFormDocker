@@ -39,6 +39,17 @@ type
     procedure CloseHandles;
   end;
 
+  /// <summary>How a process runs with respect to UAC.</summary>
+  TProcessElevationType = (
+    petUnknown,
+    /// <summary>No split token: a standard user, UAC turned off, or the built-in Administrator.</summary>
+    petDefault,
+    /// <summary>Elevated: an administrator after the UAC prompt.</summary>
+    petFull,
+    /// <summary>An administrator running NOT elevated: can elevate with a UAC prompt.</summary>
+    petLimited
+  );
+
 const
   DEFAULT_HUNG_APP_TIMEOUT_MS = 5000;
 
@@ -71,8 +82,41 @@ function TryGetProcessElevation(AProcessId: DWORD; out AElevated: Boolean): Bool
 ///   process is denied access to its token, which almost always means elevated.
 /// </summary>
 function IsProcessProbablyElevated(AProcessId: DWORD): Boolean;
-/// <summary>Starts this executable again with the "runas" verb (UAC prompt).</summary>
+/// <summary>Starts this executable again with the "runas" verb (UAC prompt), with AParameters only.</summary>
 function RelaunchSelfElevated(const AParameters: string = ''): Boolean;
+function GetElevationType: TProcessElevationType;
+
+/// <summary>
+///   Starts a program elevated (UAC prompt; no prompt when this process is elevated
+///   already). Returns the process handle: wait on it / read the exit code, then close
+///   it. Returns 0 on failure, GetLastError = ERROR_CANCELLED when the user said no.
+/// </summary>
+function StartElevated(const AFileName: string; const AParameters: string = '';
+  const AWorkingDirectory: string = ''; AShowCmd: Integer = SW_SHOWNORMAL; AParentWnd: HWND = 0): THandle;
+/// <summary>
+///   Starts a program as the normal, NOT elevated user, also from an elevated process
+///   (it uses the token of the desktop shell, Explorer, which runs non elevated). From a
+///   non elevated process it is a plain CreateProcess. Returns the process handle (close
+///   it) or 0 on failure (GetLastError). When UAC is off, or Explorer runs elevated, the
+///   program runs elevated too: there is no lower level to go to.
+/// </summary>
+function StartNonElevated(const AFileName: string; const AParameters: string = '';
+  const AWorkingDirectory: string = ''; AShowCmd: Integer = SW_SHOWNORMAL): THandle;
+
+/// <summary>The parameters of this process exactly as they were given (GetCommandLine without the exe).</summary>
+function GetCommandLineParameters: string;
+/// <summary>
+///   Starts a new elevated copy of this executable (UAC prompt) with the same parameters
+///   plus AExtraParameters, in the same working directory. When it returns True, close
+///   this instance (Application.Terminate). Tip: pass a marker in AExtraParameters and
+///   check it at startup, so a copy that still is not elevated (UAC off for a standard
+///   user...) does not restart itself again and again.
+/// </summary>
+function RestartSelfElevated(const AExtraParameters: string = ''): Boolean;
+/// <summary>The other way around: a new NOT elevated copy of this executable. See RestartSelfElevated.</summary>
+function RestartSelfNonElevated(const AExtraParameters: string = ''): Boolean;
+/// <summary>Waits for the process (blocks the calling thread) and reads its exit code.</summary>
+function WaitForProcess(AProcess: THandle; out AExitCode: DWORD; ATimeoutMs: Cardinal = INFINITE): Boolean;
 
 { Processes }
 
@@ -131,6 +175,8 @@ uses
 const
   PROCESS_QUERY_LIMITED_INFORMATION_ = $1000;
   PROCESS_SUSPEND_RESUME_ = $0800;
+  ERROR_NOT_FOUND_ = 1168;
+  TOKEN_ELEVATION_TYPE_CLASS = 18;
   TOKEN_ELEVATION_CLASS = 20;
   JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE_ = $00002000;
   JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9;
@@ -184,6 +230,11 @@ function SetInformationJobObject_(AJob: THandle; AInfoClass: Integer; AInfo: Poi
   AInfoLength: DWORD): BOOL; stdcall; external kernel32 name 'SetInformationJobObject';
 function IsWow64Process_(AProcess: THandle; var AWow64: BOOL): BOOL; stdcall;
   external kernel32 name 'IsWow64Process';
+function GetShellWindow_: HWND; stdcall; external user32 name 'GetShellWindow';
+function CreateProcessWithTokenW_(AToken: THandle; ALogonFlags: DWORD; AApplicationName: PWideChar;
+  ACommandLine: PWideChar; ACreationFlags: DWORD; AEnvironment: Pointer; ACurrentDirectory: PWideChar;
+  const AStartupInfo: TStartupInfoW; var AProcessInformation: TProcessInformation): BOOL; stdcall;
+  external advapi32 name 'CreateProcessWithTokenW';
 
 { TKillTargets }
 
@@ -361,6 +412,192 @@ begin
     LInfo.lpParameters := PChar(AParameters);
   LInfo.nShow := SW_SHOWNORMAL;
   Result := ShellExecuteEx(@LInfo);
+end;
+
+function GetElevationType: TProcessElevationType;
+var
+  LToken: THandle;
+  LType: DWORD;
+  LLength: DWORD;
+begin
+  Result := petUnknown;
+  if not OpenProcessToken(GetCurrentProcess, TOKEN_QUERY, LToken) then
+    Exit;
+  try
+    LType := 0;
+    if GetTokenInformation_(LToken, TOKEN_ELEVATION_TYPE_CLASS, @LType, SizeOf(LType), LLength) then
+      case LType of
+        1: Result := petDefault;
+        2: Result := petFull;
+        3: Result := petLimited;
+      end;
+  finally
+    CloseHandle(LToken);
+  end;
+end;
+
+function BuildCommandLineFor(const AFileName, AParameters: string): string;
+begin
+  Result := Trim(AFileName);
+  if (Result <> '') and (Result[1] <> '"') then
+    Result := '"' + Result + '"';
+  if AParameters <> '' then
+    Result := Result + ' ' + AParameters;
+end;
+
+function PCharOrNil(const AValue: string): PChar;
+begin
+  if AValue = '' then
+    Result := nil
+  else
+    Result := PChar(AValue);
+end;
+
+function StartElevated(const AFileName, AParameters, AWorkingDirectory: string; AShowCmd: Integer;
+  AParentWnd: HWND): THandle;
+var
+  LInfo: TShellExecuteInfo;
+begin
+  LInfo := Default(TShellExecuteInfo);
+  LInfo.cbSize := SizeOf(LInfo);
+  LInfo.fMask := SEE_MASK_NOCLOSEPROCESS or SEE_MASK_NOASYNC;
+  LInfo.Wnd := AParentWnd;
+  LInfo.lpVerb := 'runas';
+  LInfo.lpFile := PChar(AFileName);
+  LInfo.lpParameters := PCharOrNil(AParameters);
+  LInfo.lpDirectory := PCharOrNil(AWorkingDirectory);
+  LInfo.nShow := AShowCmd;
+  if ShellExecuteEx(@LInfo) then
+    Result := LInfo.hProcess
+  else
+    Result := 0;
+end;
+
+function StartNonElevated(const AFileName, AParameters, AWorkingDirectory: string; AShowCmd: Integer): THandle;
+var
+  LCommandLine: string;
+  LStartupInfo: TStartupInfo;
+  LProcessInfo: TProcessInformation;
+  LShellWnd: HWND;
+  LShellPid: DWORD;
+  LShellProcess: THandle;
+  LShellToken: THandle;
+  LToken: THandle;
+  LError: DWORD;
+begin
+  Result := 0;
+  LCommandLine := BuildCommandLineFor(AFileName, AParameters);
+  UniqueString(LCommandLine);
+
+  LStartupInfo := Default(TStartupInfo);
+  LStartupInfo.cb := SizeOf(LStartupInfo);
+  LStartupInfo.dwFlags := STARTF_USESHOWWINDOW;
+  LStartupInfo.wShowWindow := Word(AShowCmd);
+  LProcessInfo := Default(TProcessInformation);
+
+  if not IsCurrentProcessElevated then
+  begin
+    if CreateProcess(nil, PChar(LCommandLine), nil, nil, False, 0, nil, PCharOrNil(AWorkingDirectory),
+      LStartupInfo, LProcessInfo) then
+    begin
+      CloseHandle(LProcessInfo.hThread);
+      Result := LProcessInfo.hProcess;
+    end;
+    Exit;
+  end;
+
+  // Elevated: borrow the token of the desktop shell (Explorer), which runs as the normal
+  // user. Duplicating it and CreateProcessWithTokenW need SeImpersonatePrivilege, which
+  // an elevated administrator has.
+  LShellWnd := GetShellWindow_;
+  if LShellWnd = 0 then
+  begin
+    SetLastError(ERROR_NOT_FOUND_); // No shell running (replaced shell, service...)
+    Exit;
+  end;
+  GetWindowThreadProcessId(LShellWnd, @LShellPid);
+  LShellProcess := OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION_, False, LShellPid);
+  if LShellProcess = 0 then
+    Exit;
+  LError := 0;
+  try
+    if not OpenProcessToken(LShellProcess, TOKEN_DUPLICATE, LShellToken) then
+      Exit;
+    try
+      if not DuplicateTokenEx(LShellToken, TOKEN_QUERY or TOKEN_ASSIGN_PRIMARY or TOKEN_DUPLICATE
+        or TOKEN_ADJUST_DEFAULT or TOKEN_ADJUST_SESSIONID, nil, SecurityImpersonation, TokenPrimary, LToken) then
+        Exit;
+      try
+        if CreateProcessWithTokenW_(LToken, 0, nil, PChar(LCommandLine), 0, nil, PCharOrNil(AWorkingDirectory),
+          LStartupInfo, LProcessInfo) then
+        begin
+          CloseHandle(LProcessInfo.hThread);
+          Result := LProcessInfo.hProcess;
+        end
+        else
+          LError := GetLastError;
+      finally
+        CloseHandle(LToken);
+      end;
+    finally
+      CloseHandle(LShellToken);
+    end;
+  finally
+    CloseHandle(LShellProcess);
+    if LError <> 0 then
+      SetLastError(LError);
+  end;
+end;
+
+function GetCommandLineParameters: string;
+var
+  LCommandLine: PChar;
+  LInQuotes: Boolean;
+begin
+  // Skip the program name the same way the C runtime does, keep the rest untouched
+  LCommandLine := GetCommandLine;
+  LInQuotes := False;
+  while (LCommandLine^ <> #0) and (LInQuotes or (LCommandLine^ > ' ')) do
+  begin
+    if LCommandLine^ = '"' then
+      LInQuotes := not LInQuotes;
+    Inc(LCommandLine);
+  end;
+  while (LCommandLine^ <> #0) and (LCommandLine^ <= ' ') do
+    Inc(LCommandLine);
+  Result := LCommandLine;
+end;
+
+function SelfParameters(const AExtraParameters: string): string;
+begin
+  Result := Trim(GetCommandLineParameters + ' ' + AExtraParameters);
+end;
+
+function RestartSelfElevated(const AExtraParameters: string): Boolean;
+var
+  LProcess: THandle;
+begin
+  LProcess := StartElevated(ParamStr(0), SelfParameters(AExtraParameters), GetCurrentDir);
+  Result := LProcess <> 0;
+  if Result then
+    CloseHandle(LProcess);
+end;
+
+function RestartSelfNonElevated(const AExtraParameters: string): Boolean;
+var
+  LProcess: THandle;
+begin
+  LProcess := StartNonElevated(ParamStr(0), SelfParameters(AExtraParameters), GetCurrentDir);
+  Result := LProcess <> 0;
+  if Result then
+    CloseHandle(LProcess);
+end;
+
+function WaitForProcess(AProcess: THandle; out AExitCode: DWORD; ATimeoutMs: Cardinal): Boolean;
+begin
+  AExitCode := 0;
+  Result := (AProcess <> 0) and (WaitForSingleObject(AProcess, ATimeoutMs) = WAIT_OBJECT_0)
+    and GetExitCodeProcess(AProcess, AExitCode);
 end;
 
 { Processes }

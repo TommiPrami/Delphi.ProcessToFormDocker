@@ -27,7 +27,7 @@ Add the `Source` folder to your search path. Units:
 | `ProcessToFormDocker.Form.pas` | `TProcessDockForm`: run an app in a modal form that looks like the app's own window, get its exit code |
 | `ProcessToFormDocker.Broker.pas` | Elevated broker: dock an elevated app into a non elevated host (`RunProcessDockerBroker`) |
 | `ProcessToFormDocker.Watchdog.pas` | Background thread: exit, title, hang detection, emergency kill |
-| `ProcessToFormDocker.WinApi.pas` | Plain Win32 helpers, usable on their own (`KillProcessTree`, `GetSystemHungAppTimeout`, `RelaunchSelfElevated`, job objects...) |
+| `ProcessToFormDocker.WinApi.pas` | Plain Win32 helpers, usable on their own: [elevation](#elevation-helpers) (`StartElevated`, `StartNonElevated`, `RestartSelfElevated`...), `KillProcessTree`, `GetSystemHungAppTimeout`, job objects... |
 
 Built and tested with Delphi 13 (Win32 and Win64) on Windows 11.
 
@@ -196,9 +196,41 @@ messages to an elevated window**. So:
 | elevated | not elevated | Works |
 | not elevated | elevated | **Works with `BrokerMode`** (below). Without it, the process runs in its own window and `OnDockFailed` explains why. |
 
-`RelaunchSelfElevated` (in `ProcessToFormDocker.WinApi`) restarts your application elevated. The
-demo has a button for it. Without a broker, `KillOnHostExit` is not available for processes started
-elevated from a non-elevated host.
+Without a broker, `KillOnHostExit` is not available for processes started elevated from a
+non-elevated host.
+
+### Elevation helpers
+
+Plain functions in `ProcessToFormDocker.WinApi`, usable without `TProcessDocker`:
+
+| Function | |
+|---|---|
+| `StartElevated(FileName, Parameters, Dir, ShowCmd, ParentWnd)` | UAC prompt (none when already elevated). Returns the process handle; 0 + `ERROR_CANCELLED` when the user said no |
+| `StartNonElevated(FileName, Parameters, Dir, ShowCmd)` | Starts a program as the **normal user, also from an elevated process**. It uses the token of the desktop shell (Explorer). When UAC is off, there is no lower level and it runs elevated |
+| `RestartSelfElevated(ExtraParameters)` | New elevated copy of your exe with the same parameters and working directory. Close your app when it returns `True` |
+| `RestartSelfNonElevated(ExtraParameters)` | The other way around |
+| `WaitForProcess(Process, out ExitCode, TimeoutMs)` | Waits for the process and returns its exit code (blocks the calling thread) |
+| `GetElevationType` | `petLimited` (admin, not elevated: can elevate), `petFull` (elevated), `petDefault` (standard user / UAC off) |
+| `IsCurrentProcessElevated`, `GetCommandLineParameters`, `RelaunchSelfElevated` | |
+
+Elevate only the operation that needs it, and get its result:
+
+```pascal
+LProcess := StartElevated(ParamStr(0), '/WriteLicense "' + LFileName + '"');
+if LProcess = 0 then
+  Exit; // cancelled
+try
+  WaitForProcess(LProcess, LExitCode);
+finally
+  CloseHandle(LProcess);
+end;
+```
+
+When an app restarts itself at startup, pass a marker in `ExtraParameters` and check it. Then a
+copy that still isn't elevated (UAC off for a standard user...) doesn't restart again and again.
+
+`Tests/ElevationHelpers` tests all of them. The full run needs one UAC prompt. `/local` tests the
+part that needs none.
 
 ### Elevated application in a non-elevated host: the broker
 
@@ -303,5 +335,4 @@ Open `ProcessDockerDemo.dpr` in the IDE. The `.res` (manifest: themes, per-monit
 
 - Design-time package (`Register`) so the component can be dropped on a form.
 - Capture the docked window as an image (thumbnails for tabs) with `PrintWindow`.
-- Start a de-elevated child from an elevated host.
 - Hide Windows Terminal's own caption buttons (WT settings / command line options).
