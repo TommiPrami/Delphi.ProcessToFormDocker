@@ -36,6 +36,7 @@ type
     EditParameters: TEdit;
     CheckBoxElevated: TCheckBox;
     ButtonStart: TButton;
+    ButtonRunAsWindow: TButton;
     ButtonRelaunchAsAdmin: TButton;
     FlowPanelActions: TFlowPanel;
     ButtonClose: TButton;
@@ -64,6 +65,7 @@ type
     procedure FormCloseQuery(Sender: TObject; var CanClose: Boolean);
     procedure ComboBoxPresetChange(Sender: TObject);
     procedure ButtonStartClick(Sender: TObject);
+    procedure ButtonRunAsWindowClick(Sender: TObject);
     procedure ButtonRelaunchAsAdminClick(Sender: TObject);
     procedure ButtonCloseClick(Sender: TObject);
     procedure ButtonKillClick(Sender: TObject);
@@ -79,7 +81,9 @@ type
   private
     FEntries: TArray<TDemoEntry>;
     FSessionCounter: Integer;
+    FAppWindowSource: string;
     procedure BuildEntries;
+    procedure AppWindowLog(Sender: TObject; const AText: string);
     function ActiveSheet: TDockSheet;
     function ActiveDocker: TProcessDocker;
     function SheetOf(ASender: TObject): TDockSheet;
@@ -112,7 +116,7 @@ implementation
 {$R *.dfm}
 
 uses
-  System.StrUtils, ProcessToFormDocker.WinApi;
+  System.StrUtils, ProcessToFormDocker.WinApi, ProcessToFormDocker.Form;
 
 const
   HANG_ACTION_NOTIFY = 0;
@@ -320,6 +324,61 @@ begin
       AddLog(LSheet.BaseCaption, 'Start failed: ' + E.Message);
   end;
   UpdateControls;
+end;
+
+procedure TMainForm.ButtonRunAsWindowClick(Sender: TObject);
+var
+  LEntry: TDemoEntry;
+  LResult: TProcessFormResult;
+  LSource: string;
+begin
+  if ComboBoxPreset.ItemIndex < 0 then
+    Exit;
+  LEntry := FEntries[ComboBoxPreset.ItemIndex];
+  LSource := 'App window ' + ExtractFileName(EditFileName.Text);
+  FAppWindowSource := LSource;
+
+  // Blocks like ShowModal: the form appears when the window is docked, closes when the
+  // process exits, and the exit code comes back.
+  LResult := TProcessDockForm.ExecuteEx(EditFileName.Text, EditParameters.Text,
+    procedure(AForm: TProcessDockForm)
+    begin
+      if LEntry.IsPreset then
+      begin
+        // Window search options of the preset (Windows Terminal needs them)
+        AForm.Docker.ApplyPreset(LEntry.Preset);
+        AForm.Docker.FileName := EditFileName.Text;
+        AForm.Docker.Parameters := EditParameters.Text;
+      end;
+      AForm.Docker.RunElevated := CheckBoxElevated.Checked;
+      if CheckBoxEmergencyKill.Checked then
+        AForm.Docker.EmergencyKillTimeoutMs := EMERGENCY_KILL_MS;
+      AForm.Docker.OnLog := AppWindowLog;
+    end);
+
+  if not LResult.Started then
+  begin
+    AddLog(LSource, 'Could not start: ' + LResult.ErrorMessage);
+    MessageDlg('Could not start:' + sLineBreak + LResult.ErrorMessage, mtError, [mbOK], 0);
+    Exit;
+  end;
+
+  AddLog(LSource, Format('Finished: exit code %u / $%x, docked: %s, closed by user: %s',
+    [LResult.ExitCode, LResult.ExitCode, BoolToStr(LResult.WasDocked, True), BoolToStr(LResult.ClosedByUser, True)]));
+  if LResult.ErrorMessage <> '' then
+    AddLog(LSource, LResult.ErrorMessage);
+
+  // This is where the calling code reacts to the exit code
+  if LResult.ExitCode = 0 then
+    MessageDlg('The application finished successfully (exit code 0).', mtInformation, [mbOK], 0)
+  else
+    MessageDlg(Format('The application finished with exit code %u ($%x).', [LResult.ExitCode, LResult.ExitCode]),
+      mtWarning, [mbOK], 0);
+end;
+
+procedure TMainForm.AppWindowLog(Sender: TObject; const AText: string);
+begin
+  AddLog(FAppWindowSource, AText);
 end;
 
 procedure TMainForm.ButtonRelaunchAsAdminClick(Sender: TObject);

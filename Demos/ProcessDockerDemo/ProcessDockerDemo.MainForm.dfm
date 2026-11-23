@@ -103,9 +103,24 @@ object MainForm: TMainForm
       TabOrder = 4
       OnClick = ButtonStartClick
     end
-    object ButtonRelaunchAsAdmin: TButton
+    object ButtonRunAsWindow: TButton
       AlignWithMargins = True
       Left = 1091
+      Top = 5
+      Width = 150
+      Height = 25
+      Hint =
+        'TProcessDockForm.ExecuteEx: a modal form that looks like the app' +
+        #39's own window, returns the exit code'
+      Caption = 'Run as app window...'
+      ParentShowHint = False
+      ShowHint = True
+      TabOrder = 5
+      OnClick = ButtonRunAsWindowClick
+    end
+    object ButtonRelaunchAsAdmin: TButton
+      AlignWithMargins = True
+      Left = 1247
       Top = 5
       Width = 150
       Height = 25
@@ -113,7 +128,7 @@ object MainForm: TMainForm
       Caption = 'Restart demo as admin'
       ParentShowHint = False
       ShowHint = True
-      TabOrder = 5
+      TabOrder = 6
       OnClick = ButtonRelaunchAsAdminClick
     end
   end

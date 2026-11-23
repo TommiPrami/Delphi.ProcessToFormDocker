@@ -24,6 +24,7 @@ Add the `Source` folder to your search path. Units:
 | Unit | Contents |
 |---|---|
 | `ProcessToFormDocker.pas` | `TProcessDocker` component and its container control |
+| `ProcessToFormDocker.Form.pas` | `TProcessDockForm`: run an app in a modal form that looks like the app's own window, get its exit code |
 | `ProcessToFormDocker.Watchdog.pas` | Background thread: exit, title, hang detection, emergency kill |
 | `ProcessToFormDocker.WinApi.pas` | Plain Win32 helpers, usable on their own (`KillProcessTree`, `GetSystemHungAppTimeout`, `RelaunchSelfElevated`, job objects...) |
 
@@ -62,6 +63,55 @@ Built and tested with Delphi 13 (Win32 and Win64) on Windows 11.
   characters to a classic console), `GetInfo` (PIDs, window, state, memory usage, restart count...).
 - `ShutdownAction` decides what happens to a still-running process when the component is
   destroyed: close then kill, kill, close only, or undock and leave it running.
+
+## Run an app as "its own window" and get the exit code
+
+`TProcessDockForm` (unit `ProcessToFormDocker.Form`) is for running an application as part of a
+workflow: start it, let the user work in it, continue when it ends.
+
+```pascal
+uses
+  ProcessToFormDocker.Form;
+
+LExitCode := TProcessDockForm.Execute('C:\Tools\Importer.exe', '/interactive');
+case LExitCode of
+  0: ShowImportedData;
+  2: ShowMessage('Import cancelled');
+else
+  ShowMessageFmt('Import failed (%d)', [LExitCode]);
+end;
+```
+
+- The form stays hidden until the window is docked, then takes over the application's caption
+  (and follows it), icon, client size (scroll bars included), position and frame style: not
+  resizable, no maximize button and so on. It gets its own taskbar button. For the user it looks
+  like the application just opened.
+- It is modal. When the process ends, the form closes and `Execute` returns the exit code.
+- Closing the form (X, Alt+F4) sends `WM_CLOSE` to the application. The application decides what
+  to do ("Save changes?") and the form follows when the process has exited. It is never killed
+  for that. A console closed this way returns `$C000013A` (`STATUS_CONTROL_C_EXIT`).
+- `Execute` raises `EProcessDocker` if the process can not be started. `ExecuteEx` never raises.
+  It returns a `TProcessFormResult` with `Started`, `ExitCode`, `WasDocked`, `ClosedByUser` and
+  `ErrorMessage`.
+- If the window can not be docked (for example an elevated app in a non-elevated host), the
+  application runs in its own window. The form stays hidden and the call still waits for the
+  exit code. If the process exits before it shows a window, you get its exit code too.
+- The optional third parameter configures the form and the docker before the start:
+
+```pascal
+LResult := TProcessDockForm.ExecuteEx(TProcessDocker.PresetInfo(dpClassicCmd).FileName,
+  'cmd.exe /c build.cmd',
+  procedure(AForm: TProcessDockForm)
+  begin
+    AForm.Placement := pfpMainFormCenter;      // pfpWindow (default), pfpScreenCenter, pfpKeep
+    AForm.MirrorFrame := False;                // keep a sizeable frame
+    AForm.Docker.EmergencyKillTimeoutMs := 10000;
+  end);
+```
+
+Other properties: `UseWindowSize`, `MirrorCaption`, `MirrorIcon`, `ShowInTaskbar`. You can also
+create a `TProcessDockForm` yourself, set it up and call `Run`. The form ends with the first
+process exit, so the docker's restart options are not used here.
 
 ## Events
 
@@ -177,6 +227,8 @@ If an application behaves badly, try `UseChildStyle := False` (no `WS_CHILD`),
   Registry Editor (to show elevation), or a custom command.
 - Buttons for close / kill / restart / undock / simulate hang (suspend) / resume / send text to
   the console.
+- **Run as app window...** runs the selected command with `TProcessDockForm.ExecuteEx` and reacts
+  to the exit code.
 - Watchdog options: hang action including an *Ask* dialog, hang timeout, auto restart,
   confirmation through `OnBeforeKill` / `OnBeforeRestart`, emergency kill.
 - A live log and a status bar.

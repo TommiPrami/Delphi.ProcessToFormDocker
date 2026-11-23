@@ -195,6 +195,7 @@ type
     FOriginalExStyle: NativeInt;
     FOriginalParent: HWND;
     FOriginalRect: TRect;
+    FOriginalClientRect: TRect;
     FTitle: string;
     FStartTime: TDateTime;
     FExitCode: DWORD;
@@ -377,6 +378,13 @@ type
     property LastError: string read FLastError;
     property Container: TProcessDockContainer read FContainer;
     property EffectiveHangTimeoutMs: Cardinal read GetEffectiveHangTimeoutMs;
+    /// <summary>
+    ///   The docked window as it was before docking: window and client rect (screen
+    ///   coordinates) and style. Valid once OnDocked has fired.
+    /// </summary>
+    property OriginalWindowRect: TRect read FOriginalRect;
+    property OriginalClientRect: TRect read FOriginalClientRect;
+    property OriginalWindowStyle: NativeInt read FOriginalStyle;
   published
     /// <summary>Form, panel, tab sheet... the docked window fills it. Defaults to Owner when it is a TWinControl.</summary>
     property HostControl: TWinControl read FHostControl write SetHostControl;
@@ -1416,6 +1424,9 @@ begin
   if FOriginalParent = GetDesktopWindow then
     FOriginalParent := 0;
   GetWindowRect(FDockedWnd, FOriginalRect);
+  // Client area in screen coordinates
+  GetClientRect(FDockedWnd, FOriginalClientRect);
+  MapWindowPoints(FDockedWnd, 0, FOriginalClientRect, 2);
   FHaveOriginal := True;
 end;
 
@@ -1604,7 +1615,8 @@ begin
 
   GetWindowRect(FDockedWnd, LRect);
   MapWindowPoints(0, FContainer.Handle, LRect, 2);
-  if not IsWindowVisible(FDockedWnd) or (LRect.Left <> 0) or (LRect.Top <> 0)
+  // The window's own WS_VISIBLE: IsWindowVisible is also False while the host is hidden
+  if ((GetWindowLongPtr(FDockedWnd, GWL_STYLE) and WS_VISIBLE) = 0) or (LRect.Left <> 0) or (LRect.Top <> 0)
     or (LRect.Width <> FContainer.ClientWidth) or (LRect.Height <> FContainer.ClientHeight) then
   begin
     Log('Window changed its own position / visibility after docking, layout re-applied');
